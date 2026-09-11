@@ -1,0 +1,60 @@
+# Reassemble a release payload that was uploaded in parts.
+#
+# The nsis-web payload (~2 GB) has to reach GitHub in one piece, but a
+# single upload from the build machine dies whenever its connection drops,
+# and GitHub cannot resume a partial asset upload. So the build machine
+# uploads <asset>.part-00, .part-01, ... (100 MB each, retried per part)
+# plus latest.yml to the (draft) release, and this job - running on
+# GitHub's own network - joins them, verifies the sha512 and size that
+# latest.yml promises, uploads the whole asset, and deletes the parts.
+name: Assemble split release payload
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v3.8.6"
+        required: true
+      asset:
+        description: "Full asset name, e.g. shorz-3.8.6-x64.nsis.7z"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      ASSET: ${{ inputs.asset }}
+    steps:
+      - name: Download parts and latest.yml
+        run: |
+          set -euo pipefail
+          mkdir parts && cd parts
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET.part-*" --pattern latest.yml
+          ls -la
+
+      - name: Join and verify against latest.yml
+        run: |
+          set -euo pipefail
+          ls parts/"$ASSET".part-* | sort | xargs cat > "$ASSET"
+          expected_sha=$(awk '/^packages:/{p=1} p && /sha512:/{print $2; exit}' parts/latest.yml)
+          expected_size=$(awk '/^packages:/{p=1} p && /size:/{print $2; exit}' parts/latest.yml)
+          actual_sha=$(openssl dgst -sha512 -binary "$ASSET" | base64 -w0)
+          actual_size=$(stat -c %s "$ASSET")
+          echo "expected: $expected_sha $expected_size"
+          echo "actual:   $actual_sha $actual_size"
+          test "$actual_sha" = "$expected_sha"
+          test "$actual_size" = "$expected_size"
+
+      - name: Upload the whole asset, then remove the parts
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$ASSET" --clobber --repo "$GITHUB_REPOSITORY"
+          for p in parts/"$ASSET".part-*; do
+            gh release delete-asset "$TAG" "$(basename "$p")" --yes --repo "$GITHUB_REPOSITORY"
+          done
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size) \(.state)"'
